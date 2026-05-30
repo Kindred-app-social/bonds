@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/naiba/bonds/internal/dto"
+	"github.com/naiba/bonds/internal/models"
 	"github.com/naiba/bonds/internal/testutil"
 )
 
@@ -52,6 +53,37 @@ func TestMoveContact(t *testing.T) {
 	}
 	if resp.VaultID != vault2ID {
 		t.Errorf("Expected vault_id '%s', got '%s'", vault2ID, resp.VaultID)
+	}
+
+	var contact models.Contact
+	if err := svc.db.First(&contact, "id = ?", contactID).Error; err != nil {
+		t.Fatalf("Load moved contact failed: %v", err)
+	}
+	if contact.VaultID != vault2ID {
+		t.Errorf("Expected persisted vault_id '%s', got '%s'", vault2ID, contact.VaultID)
+	}
+}
+
+func TestMoveContactTargetVaultViewerBlocked(t *testing.T) {
+	svc, contactID, vault1ID, vault2ID, userID := setupContactMoveTest(t)
+
+	if err := svc.db.Model(&models.UserVault{}).
+		Where("user_id = ? AND vault_id = ?", userID, vault2ID).
+		Update("permission", models.PermissionViewer).Error; err != nil {
+		t.Fatalf("Update target vault permission failed: %v", err)
+	}
+
+	_, err := svc.Move(contactID, vault1ID, vault2ID, userID)
+	if err != ErrTargetVaultNotFound {
+		t.Errorf("Expected ErrTargetVaultNotFound, got %v", err)
+	}
+
+	var contact models.Contact
+	if err := svc.db.First(&contact, "id = ?", contactID).Error; err != nil {
+		t.Fatalf("Load contact failed: %v", err)
+	}
+	if contact.VaultID != vault1ID {
+		t.Errorf("Expected contact to remain in vault '%s', got '%s'", vault1ID, contact.VaultID)
 	}
 }
 

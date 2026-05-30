@@ -493,6 +493,63 @@ func TestCrossVaultToggleFavoriteBlocked(t *testing.T) {
 	}
 }
 
+func TestCrossAccountContactMoveBlocked(t *testing.T) {
+	ts := setupTestServer(t)
+	token1, _ := ts.registerTestUser(t, "cross-account-move-owner@example.com")
+	vault1 := ts.createTestVault(t, token1, "Move Owner Vault")
+	contact1 := ts.createTestContact(t, token1, vault1.ID, "MoveContact")
+
+	token2, _ := ts.registerTestUser(t, "cross-account-move-intruder@example.com")
+	vault2 := ts.createTestVault(t, token2, "Move Intruder Vault")
+
+	path := fmt.Sprintf("/api/vaults/%s/contacts/%s/move", vault1.ID, contact1.ID)
+	body := fmt.Sprintf(`{"target_vault_id":"%s"}`, vault2.ID)
+	rec := ts.doRequest(http.MethodPost, path, body, token1)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for cross-account contact move, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCrossAccountContactMoveWithSharedUserBlocked(t *testing.T) {
+	ts := setupTestServer(t)
+	token1, auth1 := ts.registerTestUser(t, "shared-cross-account-owner@example.com")
+	vault1 := ts.createTestVault(t, token1, "Shared Move Owner Vault")
+	contact1 := ts.createTestContact(t, token1, vault1.ID, "SharedMoveContact")
+
+	token2, _ := ts.registerTestUser(t, "shared-cross-account-other@example.com")
+	vault2 := ts.createTestVault(t, token2, "Shared Move Other Vault")
+	addUserToVault(t, ts, auth1.User.ID, vault2.ID, models.PermissionEditor)
+
+	path := fmt.Sprintf("/api/vaults/%s/contacts/%s/move", vault1.ID, contact1.ID)
+	body := fmt.Sprintf(`{"target_vault_id":"%s"}`, vault2.ID)
+	rec := ts.doRequest(http.MethodPost, path, body, token1)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for cross-account shared-user contact move, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestShadowContactMoveBlocked(t *testing.T) {
+	ts := setupTestServer(t)
+	token, _ := ts.registerTestUser(t, "shadow-move-owner@example.com")
+	sourceVault := ts.createTestVault(t, token, "Shadow Source Vault")
+	targetVault := ts.createTestVault(t, token, "Shadow Target Vault")
+
+	path := fmt.Sprintf("/api/vaults/%s/contacts/%s/move", sourceVault.ID, sourceVault.UserContactID)
+	body := fmt.Sprintf(`{"target_vault_id":"%s"}`, targetVault.ID)
+	rec := ts.doRequest(http.MethodPost, path, body, token)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for shadow contact move, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	var contact models.Contact
+	if err := ts.db.First(&contact, "id = ?", sourceVault.UserContactID).Error; err != nil {
+		t.Fatalf("failed to load shadow contact: %v", err)
+	}
+	if contact.VaultID != sourceVault.ID {
+		t.Errorf("expected shadow contact to remain in source vault %s, got %s", sourceVault.ID, contact.VaultID)
+	}
+}
+
 // ==================== C. Viewer Permission Enforcement ====================
 
 func setupViewerTest(t *testing.T) (ts *testServer, adminToken string, viewerToken string, vaultID string, contactID string) {
