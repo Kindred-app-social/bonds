@@ -489,11 +489,11 @@ func TestMonicaImportContacts_AgeBasedBirthdate(t *testing.T) {
 	if birthdate.Year == nil || *birthdate.Year != 2011 {
 		t.Errorf("expected age-based birthdate year=2011, got %v", birthdate.Year)
 	}
-	if birthdate.Month == nil || *birthdate.Month != 1 {
-		t.Errorf("expected age-based birthdate month=1, got %v", birthdate.Month)
+	if birthdate.Month != nil {
+		t.Errorf("expected age-based birthdate month to be nil, got %v", *birthdate.Month)
 	}
-	if birthdate.Day == nil || *birthdate.Day != 1 {
-		t.Errorf("expected age-based birthdate day=1, got %v", birthdate.Day)
+	if birthdate.Day != nil {
+		t.Errorf("expected age-based birthdate day to be nil, got %v", *birthdate.Day)
 	}
 }
 
@@ -938,6 +938,31 @@ func TestMonicaImportGifts(t *testing.T) {
 	}
 }
 
+func TestMonicaGiftType(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+		date   string
+	}{
+		{"", "given", "given"},
+		{"offered", "offered", "given"},
+		{"idea", "idea", "bought"},
+		{"searched", "searched", "bought"},
+		{"found", "found", "bought"},
+		{"bought", "bought", "bought"},
+		{"received", "received", "received"},
+		{"unknown", "given", "given"},
+	} {
+		got := monicaGiftType(tc.status)
+		if got != tc.want {
+			t.Errorf("monicaGiftType(%q) = %q, want %q", tc.status, got, tc.want)
+		}
+		if date := monicaGiftDateField(got); date != tc.date {
+			t.Errorf("monicaGiftDateField(%q) = %q, want %q", got, date, tc.date)
+		}
+	}
+}
+
 func TestMonicaImportLoans(t *testing.T) {
 	svc, vaultID, userID, _ := setupMonicaImportTest(t)
 	data := readMonicaFixture(t)
@@ -1039,6 +1064,45 @@ func TestMonicaImportContacts_Duplicate(t *testing.T) {
 	expectedCount := 4
 	if len(contacts) != expectedCount {
 		t.Errorf("expected %d contacts in vault (1 shadow + 3 imported), got %d", expectedCount, len(contacts))
+	}
+
+	var john models.Contact
+	if err := svc.DB.Where("vault_id = ? AND first_name = ?", vaultID, "John").First(&john).Error; err != nil {
+		t.Fatalf("John not found: %v", err)
+	}
+	for _, title := range []string{
+		"Monica description",
+		"Monica first met through",
+		"Monica last talked to",
+	} {
+		var count int64
+		if err := svc.DB.Model(&models.Note{}).
+			Where("contact_id = ? AND title = ?", john.ID, title).
+			Count(&count).Error; err != nil {
+			t.Fatalf("failed to count metadata note %q: %v", title, err)
+		}
+		if count != 1 {
+			t.Errorf("expected one %q note after re-import, got %d", title, count)
+		}
+	}
+	var firstMetCount int64
+	if err := svc.DB.Model(&models.ContactImportantDate{}).
+		Joins("JOIN contact_important_date_types cidt ON cidt.id = contact_important_dates.contact_important_date_type_id").
+		Where("contact_important_dates.contact_id = ? AND cidt.internal_type = ?", john.ID, "first_met").
+		Count(&firstMetCount).Error; err != nil {
+		t.Fatalf("failed to count first-met dates: %v", err)
+	}
+	if firstMetCount != 1 {
+		t.Errorf("expected one first-met date after re-import, got %d", firstMetCount)
+	}
+	var stayInTouchCount int64
+	if err := svc.DB.Model(&models.ContactReminder{}).
+		Where("contact_id = ? AND label = ?", john.ID, "Stay in touch").
+		Count(&stayInTouchCount).Error; err != nil {
+		t.Fatalf("failed to count stay-in-touch reminders: %v", err)
+	}
+	if stayInTouchCount != 1 {
+		t.Errorf("expected one stay-in-touch reminder after re-import, got %d", stayInTouchCount)
 	}
 }
 

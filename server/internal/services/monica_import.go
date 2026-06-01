@@ -368,26 +368,7 @@ func (s *MonicaImportService) importSpecialDate(
 		return
 	}
 
-	var year, month, day *int
-	if sd.Date != "" {
-		// Monica 日期格式可能是 "2006-01-02" 或 "2006-01-02T15:04:05Z"(ISO 8601)
-		dateStr := sd.Date
-		var t time.Time
-		var parseErr error
-		if t, parseErr = time.Parse(time.RFC3339, dateStr); parseErr != nil {
-			t, parseErr = time.Parse("2006-01-02", dateStr)
-		}
-		if parseErr == nil {
-			if !sd.IsYearUnknown {
-				y := t.Year()
-				year = &y
-			}
-			m := int(t.Month())
-			d := t.Day()
-			month = &m
-			day = &d
-		}
-	}
+	year, month, day := monicaSpecialDateParts(sd)
 
 	dtID := dateType.ID
 	cid := models.ContactImportantDate{
@@ -399,8 +380,10 @@ func (s *MonicaImportService) importSpecialDate(
 		Month:                      month,
 		Day:                        day,
 	}
-	if err := tx.Create(&cid).Error; err != nil {
+	if created, err := s.createMetadataImportantDate(tx, &cid); err != nil {
 		resp.Errors = append(resp.Errors, fmt.Sprintf("importantdate %s: %v", internalType, err))
+	} else if !created {
+		return
 	}
 }
 
@@ -418,17 +401,7 @@ func (s *MonicaImportService) importFirstMetDate(
 		return
 	}
 
-	var year, month, day *int
-	if t, ok := parseMonicaTimestamp(sd.Date); ok {
-		if !sd.IsYearUnknown {
-			y := t.Year()
-			year = &y
-		}
-		m := int(t.Month())
-		d := t.Day()
-		month = &m
-		day = &d
-	}
+	year, month, day := monicaSpecialDateParts(sd)
 
 	dtID := dateType.ID
 	cid := models.ContactImportantDate{
@@ -440,9 +413,34 @@ func (s *MonicaImportService) importFirstMetDate(
 		Month:                      month,
 		Day:                        day,
 	}
-	if err := tx.Create(&cid).Error; err != nil {
+	if created, err := s.createMetadataImportantDate(tx, &cid); err != nil {
 		resp.Errors = append(resp.Errors, fmt.Sprintf("importantdate first_met: %v", err))
+	} else if !created {
+		return
 	}
+}
+
+func monicaSpecialDateParts(sd *MonicaSpecialDate) (*int, *int, *int) {
+	var year, month, day *int
+	if sd == nil || sd.Date == "" {
+		return year, month, day
+	}
+	t, ok := parseMonicaTimestamp(sd.Date)
+	if !ok {
+		return year, month, day
+	}
+	if !sd.IsYearUnknown {
+		y := t.Year()
+		year = &y
+	}
+	if sd.IsAgeBased {
+		return year, month, day
+	}
+	m := int(t.Month())
+	d := t.Day()
+	month = &m
+	day = &d
+	return year, month, day
 }
 
 func (s *MonicaImportService) findOrCreateImportantDateType(tx *gorm.DB, vaultID, internalType, label string) (*models.ContactImportantDateType, error) {
@@ -509,14 +507,15 @@ func (s *MonicaImportService) importDescriptionNote(
 	if strings.TrimSpace(mc.Properties.Description) == "" {
 		return
 	}
+	title := "Monica description"
 	note := models.Note{
 		ContactID: contactID,
 		VaultID:   vaultID,
-		Title:     strPtrOrNil("Monica description"),
+		Title:     &title,
 		Body:      mc.Properties.Description,
 		AuthorID:  &userID,
 	}
-	if err := tx.Create(&note).Error; err == nil {
+	if s.createMetadataNote(tx, &note) {
 		resp.ImportedNotes++
 	}
 }
@@ -542,7 +541,7 @@ func (s *MonicaImportService) importFirstMetThroughNote(
 		Body:      body,
 		AuthorID:  &userID,
 	}
-	if err := tx.Create(&note).Error; err == nil {
+	if s.createMetadataNote(tx, &note) {
 		resp.ImportedNotes++
 	}
 }
@@ -572,6 +571,11 @@ func (s *MonicaImportService) importStayInTouchReminder(
 		reminder.Day = &d
 		reminder.Month = &m
 	}
+	var existing models.ContactReminder
+	err := tx.Where("contact_id = ? AND label = ?", contactID, reminder.Label).First(&existing).Error
+	if err == nil {
+		return
+	}
 	if err := tx.Create(&reminder).Error; err == nil {
 		resp.ImportedReminders++
 	}
@@ -598,7 +602,7 @@ func (s *MonicaImportService) importLastTalkedToNote(
 		note.CreatedAt = t
 		note.UpdatedAt = t
 	}
-	if err := tx.Create(&note).Error; err == nil {
+	if s.createMetadataNote(tx, &note) {
 		resp.ImportedNotes++
 	}
 }
@@ -623,9 +627,37 @@ func (s *MonicaImportService) importLastConsultedMetadata(
 		note.CreatedAt = t
 		note.UpdatedAt = t
 	}
-	if err := tx.Create(&note).Error; err == nil {
+	if s.createMetadataNote(tx, &note) {
 		resp.ImportedNotes++
 	}
+}
+
+func (s *MonicaImportService) createMetadataNote(tx *gorm.DB, note *models.Note) bool {
+	var existing models.Note
+	title := ""
+	if note.Title != nil {
+		title = *note.Title
+	}
+	err := tx.Where("contact_id = ? AND title = ? AND body = ?", note.ContactID, title, note.Body).First(&existing).Error
+	if err == nil {
+		return false
+	}
+	return tx.Create(note).Error == nil
+}
+
+func (s *MonicaImportService) createMetadataImportantDate(tx *gorm.DB, date *models.ContactImportantDate) (bool, error) {
+	var existing models.ContactImportantDate
+	query := tx.Where("contact_id = ? AND contact_important_date_type_id = ? AND label = ?",
+		date.ContactID, date.ContactImportantDateTypeID, date.Label)
+	if date.DistantUUID != nil {
+		query = query.Where("distant_uuid = ?", *date.DistantUUID)
+	} else {
+		query = query.Where("distant_uuid IS NULL")
+	}
+	if err := query.First(&existing).Error; err == nil {
+		return false, nil
+	}
+	return true, tx.Create(date).Error
 }
 
 func (s *MonicaImportService) importNotes(
@@ -908,12 +940,12 @@ func (s *MonicaImportService) importGifts(
 		}
 		if mg.Properties.Date != "" {
 			if t, ok := parseMonicaTimestamp(mg.Properties.Date); ok {
-				switch giftType {
+				switch monicaGiftDateField(giftType) {
 				case "received":
 					gift.ReceivedAt = &t
 				case "bought":
 					gift.BoughtAt = &t
-				default:
+				case "given":
 					gift.GivenAt = &t
 				}
 			}
@@ -924,10 +956,25 @@ func (s *MonicaImportService) importGifts(
 
 func monicaGiftType(status string) string {
 	status = strings.ToLower(strings.TrimSpace(status))
-	if status == "" {
+	switch status {
+	case "idea", "searched", "found", "bought", "offered", "received", "given":
+		return status
+	default:
 		return "given"
 	}
-	return status
+}
+
+func monicaGiftDateField(giftType string) string {
+	switch giftType {
+	case "received":
+		return "received"
+	case "idea", "searched", "found", "bought":
+		return "bought"
+	case "offered", "given":
+		return "given"
+	default:
+		return ""
+	}
 }
 
 func (s *MonicaImportService) importDebtsAsLoans(
