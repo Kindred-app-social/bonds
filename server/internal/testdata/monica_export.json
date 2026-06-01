@@ -31,6 +31,9 @@
               "company": "Acme Corp",
               "food_preferences": "Vegetarian",
               "last_talked_to": "2024-01-05T00:00:00Z",
+              "number_of_views": 42,
+              "stay_in_touch_frequency": 60,
+              "stay_in_touch_trigger_date": "2025-12-02T19:01:58Z",
               "gender": "550e8400-e29b-41d4-a716-446655440020",
               "tags": ["friend", "college"],
               "birthdate": {
