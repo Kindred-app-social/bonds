@@ -136,6 +136,7 @@ func (s *MonicaImportService) Import(vaultID, userID string, data []byte) (*dto.
 		if !ok {
 			continue
 		}
+		s.importContactProfileMetadata(s.DB, &mc, contactID, vaultID, userID, contactUUIDMap, resp)
 		s.importContactSubResources(
 			s.DB, &mc, contactID, vaultID, accountID, userID, userContactID,
 			fieldTypeByUUID, lifeEventTypeByUUID, activityByUUID, resp,
@@ -228,6 +229,16 @@ func (s *MonicaImportService) importContact(
 		}
 	}
 
+	var companyID *uint
+	if mc.Properties.Company != "" {
+		company, err := s.findOrCreateCompany(tx, vaultID, mc.Properties.Company)
+		if err != nil {
+			resp.Errors = append(resp.Errors, fmt.Sprintf("company %q: %v", mc.Properties.Company, err))
+		} else {
+			companyID = &company.ID
+		}
+	}
+
 	listed := !mc.Properties.IsPartial
 	contact := models.Contact{
 		VaultID:     vaultID,
@@ -237,6 +248,7 @@ func (s *MonicaImportService) importContact(
 		Nickname:    strPtrOrNil(mc.Properties.Nickname),
 		JobPosition: strPtrOrNil(mc.Properties.Job),
 		GenderID:    genderID,
+		CompanyID:   companyID,
 		DistantUUID: strPtrOrNil(mc.UUID),
 		Listed:      listed,
 	}
@@ -256,13 +268,25 @@ func (s *MonicaImportService) importContact(
 	}
 
 	cvu := models.ContactVaultUser{
-		ContactID:  contact.ID,
-		VaultID:    vaultID,
-		UserID:     userID,
-		IsFavorite: mc.Properties.IsStarred,
+		ContactID:     contact.ID,
+		VaultID:       vaultID,
+		UserID:        userID,
+		NumberOfViews: mc.Properties.NumberOfViews,
+		IsFavorite:    mc.Properties.IsStarred,
 	}
 	if err := tx.Create(&cvu).Error; err != nil {
 		return "", false, fmt.Errorf("create contact_vault_user: %w", err)
+	}
+
+	if companyID != nil {
+		job := models.ContactCompany{
+			ContactID:   contact.ID,
+			CompanyID:   *companyID,
+			JobPosition: strPtrOrNil(mc.Properties.Job),
+		}
+		if err := tx.Create(&job).Error; err != nil {
+			resp.Errors = append(resp.Errors, fmt.Sprintf("company job %q: %v", mc.Properties.Company, err))
+		}
 	}
 
 	for _, tagName := range mc.Properties.Tags {
@@ -299,6 +323,23 @@ func (s *MonicaImportService) importContact(
 	return contact.ID, true, nil
 }
 
+func (s *MonicaImportService) findOrCreateCompany(tx *gorm.DB, vaultID, name string) (*models.Company, error) {
+	name = strings.TrimSpace(name)
+	var company models.Company
+	err := tx.Where("vault_id = ? AND LOWER(name) = LOWER(?)", vaultID, name).First(&company).Error
+	if err == nil {
+		return &company, nil
+	}
+	company = models.Company{
+		VaultID: vaultID,
+		Name:    name,
+	}
+	if err := tx.Create(&company).Error; err != nil {
+		return nil, err
+	}
+	return &company, nil
+}
+
 func (s *MonicaImportService) findOrCreateLabel(tx *gorm.DB, vaultID, name string) (*models.Label, error) {
 	slug := slugify(name)
 	var label models.Label
@@ -327,39 +368,96 @@ func (s *MonicaImportService) importSpecialDate(
 		return
 	}
 
-	var year, month, day *int
-	if sd.Date != "" && !sd.IsAgeBased {
-		// Monica 日期格式可能是 "2006-01-02" 或 "2006-01-02T15:04:05Z"(ISO 8601)
-		dateStr := sd.Date
-		var t time.Time
-		var parseErr error
-		if t, parseErr = time.Parse(time.RFC3339, dateStr); parseErr != nil {
-			t, parseErr = time.Parse("2006-01-02", dateStr)
-		}
-		if parseErr == nil {
-			if !sd.IsYearUnknown {
-				y := t.Year()
-				year = &y
-			}
-			m := int(t.Month())
-			d := t.Day()
-			month = &m
-			day = &d
-		}
-	}
+	year, month, day := monicaSpecialDateParts(sd)
 
 	dtID := dateType.ID
 	cid := models.ContactImportantDate{
 		ContactID:                  contactID,
 		ContactImportantDateTypeID: &dtID,
 		Label:                      label,
+		DistantUUID:                strPtrOrNil(sd.UUID),
 		Year:                       year,
 		Month:                      month,
 		Day:                        day,
 	}
-	if err := tx.Create(&cid).Error; err != nil {
+	if created, err := s.createMetadataImportantDate(tx, &cid); err != nil {
 		resp.Errors = append(resp.Errors, fmt.Sprintf("importantdate %s: %v", internalType, err))
+	} else if !created {
+		return
 	}
+}
+
+func (s *MonicaImportService) importFirstMetDate(
+	tx *gorm.DB, contactID, vaultID string,
+	sd *MonicaSpecialDate,
+	resp *dto.MonicaImportResponse,
+) {
+	if sd == nil {
+		return
+	}
+	dateType, err := s.findOrCreateImportantDateType(tx, vaultID, "first_met", "First met")
+	if err != nil {
+		resp.Errors = append(resp.Errors, fmt.Sprintf("importantdate first_met: %v", err))
+		return
+	}
+
+	year, month, day := monicaSpecialDateParts(sd)
+
+	dtID := dateType.ID
+	cid := models.ContactImportantDate{
+		ContactID:                  contactID,
+		ContactImportantDateTypeID: &dtID,
+		Label:                      "First met",
+		DistantUUID:                strPtrOrNil(sd.UUID),
+		Year:                       year,
+		Month:                      month,
+		Day:                        day,
+	}
+	if created, err := s.createMetadataImportantDate(tx, &cid); err != nil {
+		resp.Errors = append(resp.Errors, fmt.Sprintf("importantdate first_met: %v", err))
+	} else if !created {
+		return
+	}
+}
+
+func monicaSpecialDateParts(sd *MonicaSpecialDate) (*int, *int, *int) {
+	var year, month, day *int
+	if sd == nil || sd.Date == "" {
+		return year, month, day
+	}
+	t, ok := parseMonicaTimestamp(sd.Date)
+	if !ok {
+		return year, month, day
+	}
+	if !sd.IsYearUnknown {
+		y := t.Year()
+		year = &y
+	}
+	if sd.IsAgeBased {
+		return year, month, day
+	}
+	m := int(t.Month())
+	d := t.Day()
+	month = &m
+	day = &d
+	return year, month, day
+}
+
+func (s *MonicaImportService) findOrCreateImportantDateType(tx *gorm.DB, vaultID, internalType, label string) (*models.ContactImportantDateType, error) {
+	var dateType models.ContactImportantDateType
+	err := tx.Where("vault_id = ? AND internal_type = ?", vaultID, internalType).First(&dateType).Error
+	if err == nil {
+		return &dateType, nil
+	}
+	dateType = models.ContactImportantDateType{
+		VaultID:      vaultID,
+		Label:        label,
+		InternalType: strPtrOrNil(internalType),
+	}
+	if err := tx.Create(&dateType).Error; err != nil {
+		return nil, err
+	}
+	return &dateType, nil
 }
 
 func (s *MonicaImportService) importContactSubResources(
@@ -368,7 +466,7 @@ func (s *MonicaImportService) importContactSubResources(
 	contactID, vaultID, accountID, userID, userContactID string,
 	fieldTypeByUUID map[string]MonicaContactFieldTypeRef,
 	lifeEventTypeByUUID map[string]string,
-	activityByUUID map[string]string,
+	activityByUUID map[string]monicaActivityNote,
 	resp *dto.MonicaImportResponse,
 ) {
 	s.importNotes(tx, mc, contactID, vaultID, userID, resp)
@@ -383,6 +481,183 @@ func (s *MonicaImportService) importContactSubResources(
 	s.importLifeEvents(tx, mc, contactID, vaultID, lifeEventTypeByUUID, resp)
 	s.importActivitiesAsNotes(tx, mc, contactID, vaultID, userID, activityByUUID, resp)
 	s.importConversationsAsNotes(tx, mc, contactID, vaultID, userID, resp)
+}
+
+func (s *MonicaImportService) importContactProfileMetadata(
+	tx *gorm.DB,
+	mc *MonicaContact,
+	contactID, vaultID, userID string,
+	contactUUIDMap map[string]string,
+	resp *dto.MonicaImportResponse,
+) {
+	s.importDescriptionNote(tx, mc, contactID, vaultID, userID, resp)
+	s.importFirstMetDate(tx, contactID, vaultID, mc.Properties.FirstMetDate, resp)
+	s.importFirstMetThroughNote(tx, mc, contactID, vaultID, userID, contactUUIDMap, resp)
+	s.importStayInTouchReminder(tx, mc, contactID, resp)
+	s.importLastTalkedToNote(tx, mc, contactID, vaultID, userID, resp)
+	s.importLastConsultedMetadata(tx, mc, contactID, vaultID, userID, resp)
+}
+
+func (s *MonicaImportService) importDescriptionNote(
+	tx *gorm.DB,
+	mc *MonicaContact,
+	contactID, vaultID, userID string,
+	resp *dto.MonicaImportResponse,
+) {
+	if strings.TrimSpace(mc.Properties.Description) == "" {
+		return
+	}
+	title := "Monica description"
+	note := models.Note{
+		ContactID: contactID,
+		VaultID:   vaultID,
+		Title:     &title,
+		Body:      mc.Properties.Description,
+		AuthorID:  &userID,
+	}
+	if s.createMetadataNote(tx, &note) {
+		resp.ImportedNotes++
+	}
+}
+
+func (s *MonicaImportService) importFirstMetThroughNote(
+	tx *gorm.DB,
+	mc *MonicaContact,
+	contactID, vaultID, userID string,
+	contactUUIDMap map[string]string,
+	resp *dto.MonicaImportResponse,
+) {
+	if mc.Properties.FirstMetThrough == "" {
+		return
+	}
+	body := "First met through Monica contact UUID: " + mc.Properties.FirstMetThrough
+	if relatedID, ok := contactUUIDMap[mc.Properties.FirstMetThrough]; ok {
+		body = "First met through contact ID: " + relatedID
+	}
+	note := models.Note{
+		ContactID: contactID,
+		VaultID:   vaultID,
+		Title:     strPtrOrNil("Monica first met through"),
+		Body:      body,
+		AuthorID:  &userID,
+	}
+	if s.createMetadataNote(tx, &note) {
+		resp.ImportedNotes++
+	}
+}
+
+func (s *MonicaImportService) importStayInTouchReminder(
+	tx *gorm.DB,
+	mc *MonicaContact,
+	contactID string,
+	resp *dto.MonicaImportResponse,
+) {
+	if mc.Properties.StayInTouchFrequency <= 0 && mc.Properties.StayInTouchTriggerDate == "" {
+		return
+	}
+	frequency := mc.Properties.StayInTouchFrequency
+	if frequency <= 0 {
+		frequency = 1
+	}
+	reminder := models.ContactReminder{
+		ContactID:       contactID,
+		Label:           "Stay in touch",
+		Type:            "one_time",
+		FrequencyNumber: &frequency,
+	}
+	if t, ok := parseMonicaTimestamp(mc.Properties.StayInTouchTriggerDate); ok {
+		d := t.Day()
+		m := int(t.Month())
+		reminder.Day = &d
+		reminder.Month = &m
+	}
+	var existing models.ContactReminder
+	err := tx.Where("contact_id = ? AND label = ?", contactID, reminder.Label).First(&existing).Error
+	if err == nil {
+		return
+	}
+	if err := tx.Create(&reminder).Error; err == nil {
+		resp.ImportedReminders++
+	}
+}
+
+func (s *MonicaImportService) importLastTalkedToNote(
+	tx *gorm.DB,
+	mc *MonicaContact,
+	contactID, vaultID, userID string,
+	resp *dto.MonicaImportResponse,
+) {
+	if mc.Properties.LastTalkedTo == "" {
+		return
+	}
+	body := "Last talked to: " + mc.Properties.LastTalkedTo
+	note := models.Note{
+		ContactID: contactID,
+		VaultID:   vaultID,
+		Title:     strPtrOrNil("Monica last talked to"),
+		Body:      body,
+		AuthorID:  &userID,
+	}
+	if t, ok := parseMonicaTimestamp(mc.Properties.LastTalkedTo); ok {
+		note.CreatedAt = t
+		note.UpdatedAt = t
+	}
+	if s.createMetadataNote(tx, &note) {
+		resp.ImportedNotes++
+	}
+}
+
+func (s *MonicaImportService) importLastConsultedMetadata(
+	tx *gorm.DB,
+	mc *MonicaContact,
+	contactID, vaultID, userID string,
+	resp *dto.MonicaImportResponse,
+) {
+	if mc.Properties.LastConsultedAt == "" {
+		return
+	}
+	note := models.Note{
+		ContactID: contactID,
+		VaultID:   vaultID,
+		Title:     strPtrOrNil("Monica last consulted"),
+		Body:      "Last consulted at: " + mc.Properties.LastConsultedAt,
+		AuthorID:  &userID,
+	}
+	if t, ok := parseMonicaTimestamp(mc.Properties.LastConsultedAt); ok {
+		note.CreatedAt = t
+		note.UpdatedAt = t
+	}
+	if s.createMetadataNote(tx, &note) {
+		resp.ImportedNotes++
+	}
+}
+
+func (s *MonicaImportService) createMetadataNote(tx *gorm.DB, note *models.Note) bool {
+	var existing models.Note
+	title := ""
+	if note.Title != nil {
+		title = *note.Title
+	}
+	err := tx.Where("contact_id = ? AND title = ? AND body = ?", note.ContactID, title, note.Body).First(&existing).Error
+	if err == nil {
+		return false
+	}
+	return tx.Create(note).Error == nil
+}
+
+func (s *MonicaImportService) createMetadataImportantDate(tx *gorm.DB, date *models.ContactImportantDate) (bool, error) {
+	var existing models.ContactImportantDate
+	query := tx.Where("contact_id = ? AND contact_important_date_type_id = ? AND label = ?",
+		date.ContactID, date.ContactImportantDateTypeID, date.Label)
+	if date.DistantUUID != nil {
+		query = query.Where("distant_uuid = ?", *date.DistantUUID)
+	} else {
+		query = query.Where("distant_uuid IS NULL")
+	}
+	if err := query.First(&existing).Error; err == nil {
+		return false, nil
+	}
+	return true, tx.Create(date).Error
 }
 
 func (s *MonicaImportService) importNotes(
@@ -652,10 +927,7 @@ func (s *MonicaImportService) importGifts(
 		if err := json.Unmarshal(raw, &mg); err != nil {
 			continue
 		}
-		giftType := "given"
-		if mg.Properties.Status == "received" {
-			giftType = "received"
-		}
+		giftType := monicaGiftType(mg.Properties.Status)
 		gift := models.Gift{
 			ContactID:   contactID,
 			Name:        mg.Properties.Name,
@@ -667,15 +939,41 @@ func (s *MonicaImportService) importGifts(
 			gift.EstimatedPrice = &amt
 		}
 		if mg.Properties.Date != "" {
-			if t, err := time.Parse("2006-01-02", mg.Properties.Date); err == nil {
-				if giftType == "received" {
+			if t, ok := parseMonicaTimestamp(mg.Properties.Date); ok {
+				switch monicaGiftDateField(giftType) {
+				case "received":
 					gift.ReceivedAt = &t
-				} else {
+				case "bought":
+					gift.BoughtAt = &t
+				case "given":
 					gift.GivenAt = &t
 				}
 			}
 		}
 		tx.Create(&gift)
+	}
+}
+
+func monicaGiftType(status string) string {
+	status = strings.ToLower(strings.TrimSpace(status))
+	switch status {
+	case "idea", "searched", "found", "bought", "offered", "received", "given":
+		return status
+	default:
+		return "given"
+	}
+}
+
+func monicaGiftDateField(giftType string) string {
+	switch giftType {
+	case "received":
+		return "received"
+	case "idea", "searched", "found", "bought":
+		return "bought"
+	case "offered", "given":
+		return "given"
+	default:
+		return ""
 	}
 }
 
@@ -776,7 +1074,7 @@ func (s *MonicaImportService) importLifeEvents(
 
 func (s *MonicaImportService) importActivitiesAsNotes(
 	tx *gorm.DB, mc *MonicaContact, contactID, vaultID, userID string,
-	activityByUUID map[string]string,
+	activityByUUID map[string]monicaActivityNote,
 	resp *dto.MonicaImportResponse,
 ) {
 	// contact.data[type="activities"] values u662f UUID string u6570u7ec4uff0cu975e MonicaActivity u5bf9u8c61
@@ -792,8 +1090,12 @@ func (s *MonicaImportService) importActivitiesAsNotes(
 		note := models.Note{
 			ContactID: contactID,
 			VaultID:   vaultID,
-			Body:      activityContent,
+			Body:      activityContent.Body,
 			AuthorID:  &userID,
+		}
+		if !activityContent.HappenedAt.IsZero() {
+			note.CreatedAt = activityContent.HappenedAt
+			note.UpdatedAt = activityContent.HappenedAt
 		}
 		if err := tx.Create(&note).Error; err == nil {
 			resp.ImportedNotes++
@@ -829,14 +1131,23 @@ func (s *MonicaImportService) importConversationsAsNotes(
 			Body:      body,
 			AuthorID:  &userID,
 		}
+		if t, ok := parseMonicaTimestamp(mconv.Properties.HappenedAt); ok {
+			note.CreatedAt = t
+			note.UpdatedAt = t
+		}
 		if err := tx.Create(&note).Error; err == nil {
 			resp.ImportedNotes++
 		}
 	}
 }
 
-func buildActivityContentMap(accountData []MonicaCollection, activityTypeByUUID map[string]string) map[string]string {
-	result := make(map[string]string)
+type monicaActivityNote struct {
+	Body       string
+	HappenedAt time.Time
+}
+
+func buildActivityContentMap(accountData []MonicaCollection, activityTypeByUUID map[string]string) map[string]monicaActivityNote {
+	result := make(map[string]monicaActivityNote)
 	for _, raw := range getCollectionByType(accountData, "activities") {
 		var ma MonicaActivity
 		if err := json.Unmarshal(raw, &ma); err != nil {
@@ -852,7 +1163,11 @@ func buildActivityContentMap(accountData []MonicaCollection, activityTypeByUUID 
 		if ma.Properties.Description != "" {
 			body += "\n" + ma.Properties.Description
 		}
-		result[ma.UUID] = body
+		note := monicaActivityNote{Body: body}
+		if t, ok := parseMonicaTimestamp(ma.Properties.HappenedAt); ok {
+			note.HappenedAt = t
+		}
+		result[ma.UUID] = note
 	}
 	return result
 }
@@ -889,6 +1204,8 @@ var monicaRelationshipTypeAliases = map[string]string{
 	"godparent":         "seed.relationship_types.godparent",
 	"godchild":          "seed.relationship_types.godchild",
 	"friend":            "seed.relationship_types.friend",
+	"bestfriend":        "seed.relationship_types.best_friend",
+	"best-friend":       "seed.relationship_types.best_friend",
 	"best_friend":       "seed.relationship_types.best_friend",
 	"colleague":         "seed.relationship_types.colleague",
 	"boss":              "seed.relationship_types.boss",
@@ -1238,26 +1555,30 @@ type MonicaContact struct {
 }
 
 type MonicaContactProps struct {
-	FirstName       string             `json:"first_name"`
-	MiddleName      string             `json:"middle_name"`
-	LastName        string             `json:"last_name"`
-	Nickname        string             `json:"nickname"`
-	Description     string             `json:"description"`
-	IsStarred       bool               `json:"is_starred"`
-	IsPartial       bool               `json:"is_partial"`
-	IsActive        bool               `json:"is_active"`
-	IsDead          bool               `json:"is_dead"`
-	Job             string             `json:"job"`
-	Company         string             `json:"company"`
-	FoodPreferences string             `json:"food_preferences"`
-	LastTalkedTo    string             `json:"last_talked_to"`
-	Gender          string             `json:"gender"`
-	Tags            []string           `json:"tags"`
-	Birthdate       *MonicaSpecialDate `json:"birthdate"`
-	DeceasedDate    *MonicaSpecialDate `json:"deceased_date"`
-	FirstMetDate    *MonicaSpecialDate `json:"first_met_date"`
-	FirstMetThrough string             `json:"first_met_through"`
-	Avatar          *MonicaAvatar      `json:"avatar"`
+	FirstName              string             `json:"first_name"`
+	MiddleName             string             `json:"middle_name"`
+	LastName               string             `json:"last_name"`
+	Nickname               string             `json:"nickname"`
+	Description            string             `json:"description"`
+	IsStarred              bool               `json:"is_starred"`
+	IsPartial              bool               `json:"is_partial"`
+	IsActive               bool               `json:"is_active"`
+	IsDead                 bool               `json:"is_dead"`
+	Job                    string             `json:"job"`
+	Company                string             `json:"company"`
+	FoodPreferences        string             `json:"food_preferences"`
+	LastTalkedTo           string             `json:"last_talked_to"`
+	LastConsultedAt        string             `json:"last_consulted_at"`
+	NumberOfViews          int                `json:"number_of_views"`
+	StayInTouchFrequency   int                `json:"stay_in_touch_frequency"`
+	StayInTouchTriggerDate string             `json:"stay_in_touch_trigger_date"`
+	Gender                 string             `json:"gender"`
+	Tags                   []string           `json:"tags"`
+	Birthdate              *MonicaSpecialDate `json:"birthdate"`
+	DeceasedDate           *MonicaSpecialDate `json:"deceased_date"`
+	FirstMetDate           *MonicaSpecialDate `json:"first_met_date"`
+	FirstMetThrough        string             `json:"first_met_through"`
+	Avatar                 *MonicaAvatar      `json:"avatar"`
 }
 
 type MonicaSpecialDate struct {

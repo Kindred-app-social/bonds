@@ -445,6 +445,58 @@ func TestMonicaImportContacts_Birthdate(t *testing.T) {
 	}
 }
 
+func TestMonicaImportContacts_AgeBasedBirthdate(t *testing.T) {
+	svc, vaultID, userID, _ := setupMonicaImportTest(t)
+
+	exportJSON := `{
+		"version": "1.0-preview.1",
+		"account": {
+			"uuid": "test-account",
+			"data": [
+				{"count": 1, "type": "contacts", "values": [
+					{"uuid": "c1", "properties": {
+						"first_name": "Alice",
+						"birthdate": {
+							"uuid": "b1",
+							"is_age_based": true,
+							"is_year_unknown": false,
+							"date": "2011-01-01T00:00:00.000000Z"
+						}
+					}, "data": []}
+				]}
+			],
+			"properties": {},
+			"instance": {}
+		}
+	}`
+
+	_, err := svc.Import(vaultID, userID, []byte(exportJSON))
+	if err != nil {
+		t.Fatalf("Import failed: %v", err)
+	}
+
+	var alice models.Contact
+	if err := svc.DB.Where("vault_id = ? AND first_name = ?", vaultID, "Alice").First(&alice).Error; err != nil {
+		t.Fatalf("Alice not found: %v", err)
+	}
+	var birthdate models.ContactImportantDate
+	if err := svc.DB.
+		Preload("ContactImportantDateType").
+		Where("contact_id = ?", alice.ID).
+		First(&birthdate).Error; err != nil {
+		t.Fatalf("birthdate not found: %v", err)
+	}
+	if birthdate.Year == nil || *birthdate.Year != 2011 {
+		t.Errorf("expected age-based birthdate year=2011, got %v", birthdate.Year)
+	}
+	if birthdate.Month != nil {
+		t.Errorf("expected age-based birthdate month to be nil, got %v", *birthdate.Month)
+	}
+	if birthdate.Day != nil {
+		t.Errorf("expected age-based birthdate day to be nil, got %v", *birthdate.Day)
+	}
+}
+
 func TestMonicaImportContacts_DeceasedDate(t *testing.T) {
 	svc, vaultID, userID, _ := setupMonicaImportTest(t)
 	data := readMonicaFixture(t)
@@ -536,9 +588,9 @@ func TestMonicaImportNotes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import failed: %v", err)
 	}
-	// John has 1 original note + 1 activity-as-note + 1 conversation-as-note = 3
-	if resp.ImportedNotes != 3 {
-		t.Errorf("expected 3 imported notes (1 note + 1 activity + 1 conversation), got %d", resp.ImportedNotes)
+	// John has 1 original note + preserved Monica metadata notes + 1 activity-as-note + 1 conversation-as-note.
+	if resp.ImportedNotes != 6 {
+		t.Errorf("expected 6 imported notes, got %d", resp.ImportedNotes)
 	}
 
 	var john models.Contact
@@ -549,8 +601,8 @@ func TestMonicaImportNotes(t *testing.T) {
 	if err := svc.DB.Where("contact_id = ?", john.ID).Find(&notes).Error; err != nil {
 		t.Fatalf("failed to query notes: %v", err)
 	}
-	if len(notes) != 3 {
-		t.Fatalf("expected 3 notes, got %d", len(notes))
+	if len(notes) != 6 {
+		t.Fatalf("expected 6 notes, got %d", len(notes))
 	}
 	foundOriginal := false
 	for _, n := range notes {
@@ -561,6 +613,96 @@ func TestMonicaImportNotes(t *testing.T) {
 	}
 	if !foundOriginal {
 		t.Error("expected to find original note body")
+	}
+}
+
+func TestMonicaImportContacts_ProfileMetadata(t *testing.T) {
+	svc, vaultID, userID, _ := setupMonicaImportTest(t)
+	data := readMonicaFixture(t)
+
+	_, err := svc.Import(vaultID, userID, data)
+	if err != nil {
+		t.Fatalf("Import failed: %v", err)
+	}
+
+	var john models.Contact
+	if err := svc.DB.Where("vault_id = ? AND first_name = ?", vaultID, "John").First(&john).Error; err != nil {
+		t.Fatalf("John not found: %v", err)
+	}
+
+	var company models.Company
+	if err := svc.DB.Where("vault_id = ? AND name = ?", vaultID, "Acme Corp").First(&company).Error; err != nil {
+		t.Fatalf("company not imported: %v", err)
+	}
+	if john.CompanyID == nil || *john.CompanyID != company.ID {
+		t.Errorf("expected John.CompanyID=%d, got %v", company.ID, john.CompanyID)
+	}
+
+	var jobs []models.ContactCompany
+	if err := svc.DB.Where("contact_id = ? AND company_id = ?", john.ID, company.ID).Find(&jobs).Error; err != nil {
+		t.Fatalf("failed to query imported company job: %v", err)
+	}
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 imported company job, got %d", len(jobs))
+	}
+	if jobs[0].JobPosition == nil || *jobs[0].JobPosition != "Software Engineer" {
+		t.Errorf("expected imported job position, got %v", jobs[0].JobPosition)
+	}
+
+	var cvu models.ContactVaultUser
+	if err := svc.DB.Where("contact_id = ? AND vault_id = ?", john.ID, vaultID).First(&cvu).Error; err != nil {
+		t.Fatalf("ContactVaultUser not found: %v", err)
+	}
+	if cvu.NumberOfViews != 42 {
+		t.Errorf("expected number_of_views=42, got %d", cvu.NumberOfViews)
+	}
+
+	var notes []models.Note
+	if err := svc.DB.Where("contact_id = ?", john.ID).Find(&notes).Error; err != nil {
+		t.Fatalf("failed to query notes: %v", err)
+	}
+	for _, want := range []string{"College friend", "First met through contact ID:", "Last talked to: 2024-01-05T00:00:00Z"} {
+		found := false
+		for _, n := range notes {
+			if strings.Contains(n.Body, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected imported metadata note containing %q", want)
+		}
+	}
+
+	var firstMet models.ContactImportantDate
+	if err := svc.DB.
+		Joins("JOIN contact_important_date_types cidt ON cidt.id = contact_important_dates.contact_important_date_type_id").
+		Where("contact_important_dates.contact_id = ? AND cidt.internal_type = ?", john.ID, "first_met").
+		First(&firstMet).Error; err != nil {
+		t.Fatalf("first-met important date not imported: %v", err)
+	}
+	if firstMet.Year == nil || *firstMet.Year != 2010 {
+		t.Errorf("expected first-met year=2010, got %v", firstMet.Year)
+	}
+	if firstMet.Month == nil || *firstMet.Month != 9 {
+		t.Errorf("expected first-met month=9, got %v", firstMet.Month)
+	}
+	if firstMet.Day == nil || *firstMet.Day != 1 {
+		t.Errorf("expected first-met day=1, got %v", firstMet.Day)
+	}
+
+	var stayInTouch models.ContactReminder
+	if err := svc.DB.Where("contact_id = ? AND label = ?", john.ID, "Stay in touch").First(&stayInTouch).Error; err != nil {
+		t.Fatalf("stay-in-touch reminder not imported: %v", err)
+	}
+	if stayInTouch.FrequencyNumber == nil || *stayInTouch.FrequencyNumber != 60 {
+		t.Errorf("expected stay-in-touch frequency=60, got %v", stayInTouch.FrequencyNumber)
+	}
+	if stayInTouch.Day == nil || *stayInTouch.Day != 2 {
+		t.Errorf("expected stay-in-touch day=2, got %v", stayInTouch.Day)
+	}
+	if stayInTouch.Month == nil || *stayInTouch.Month != 12 {
+		t.Errorf("expected stay-in-touch month=12, got %v", stayInTouch.Month)
 	}
 }
 
@@ -637,8 +779,8 @@ func TestMonicaImportReminders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import failed: %v", err)
 	}
-	if resp.ImportedReminders != 1 {
-		t.Errorf("expected 1 imported reminder, got %d", resp.ImportedReminders)
+	if resp.ImportedReminders != 2 {
+		t.Errorf("expected 2 imported reminders, got %d", resp.ImportedReminders)
 	}
 
 	var john models.Contact
@@ -649,20 +791,27 @@ func TestMonicaImportReminders(t *testing.T) {
 	if err := svc.DB.Where("contact_id = ?", john.ID).Find(&reminders).Error; err != nil {
 		t.Fatalf("failed to query reminders: %v", err)
 	}
-	if len(reminders) != 1 {
-		t.Fatalf("expected 1 reminder, got %d", len(reminders))
+	if len(reminders) != 2 {
+		t.Fatalf("expected 2 reminders, got %d", len(reminders))
 	}
-	if reminders[0].Type != "recurring_year" {
-		t.Errorf("expected reminder type=recurring_year, got %s", reminders[0].Type)
+	var birthday *models.ContactReminder
+	for i := range reminders {
+		if reminders[i].Label == "John's birthday" {
+			birthday = &reminders[i]
+			break
+		}
 	}
-	if reminders[0].Label != "John's birthday" {
-		t.Errorf("expected reminder label=John's birthday, got %s", reminders[0].Label)
+	if birthday == nil {
+		t.Fatal("expected birthday reminder")
 	}
-	if reminders[0].Day == nil || *reminders[0].Day != 15 {
-		t.Errorf("expected reminder day=15, got %v", reminders[0].Day)
+	if birthday.Type != "recurring_year" {
+		t.Errorf("expected reminder type=recurring_year, got %s", birthday.Type)
 	}
-	if reminders[0].Month == nil || *reminders[0].Month != 5 {
-		t.Errorf("expected reminder month=5, got %v", reminders[0].Month)
+	if birthday.Day == nil || *birthday.Day != 15 {
+		t.Errorf("expected reminder day=15, got %v", birthday.Day)
+	}
+	if birthday.Month == nil || *birthday.Month != 5 {
+		t.Errorf("expected reminder month=5, got %v", birthday.Month)
 	}
 }
 
@@ -772,14 +921,45 @@ func TestMonicaImportGifts(t *testing.T) {
 	if len(gifts) != 1 {
 		t.Fatalf("expected 1 gift, got %d", len(gifts))
 	}
-	if gifts[0].Type != "given" {
-		t.Errorf("expected gift type=given (status=offered), got %s", gifts[0].Type)
+	if gifts[0].Type != "offered" {
+		t.Errorf("expected gift type=offered, got %s", gifts[0].Type)
 	}
 	if gifts[0].Name != "Book: Clean Code" {
 		t.Errorf("expected gift name=Book: Clean Code, got %s", gifts[0].Name)
 	}
 	if gifts[0].EstimatedPrice == nil || *gifts[0].EstimatedPrice != 3599 {
 		t.Errorf("expected gift estimated_price=3599 (35.99*100), got %v", gifts[0].EstimatedPrice)
+	}
+	if gifts[0].GivenAt == nil {
+		t.Fatal("expected Monica gift date to be preserved")
+	}
+	if gifts[0].GivenAt.Format("2006-01-02") != "2023-12-25" {
+		t.Errorf("expected gift date=2023-12-25, got %s", gifts[0].GivenAt.Format("2006-01-02"))
+	}
+}
+
+func TestMonicaGiftType(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   string
+		date   string
+	}{
+		{"", "given", "given"},
+		{"offered", "offered", "given"},
+		{"idea", "idea", "bought"},
+		{"searched", "searched", "bought"},
+		{"found", "found", "bought"},
+		{"bought", "bought", "bought"},
+		{"received", "received", "received"},
+		{"unknown", "given", "given"},
+	} {
+		got := monicaGiftType(tc.status)
+		if got != tc.want {
+			t.Errorf("monicaGiftType(%q) = %q, want %q", tc.status, got, tc.want)
+		}
+		if date := monicaGiftDateField(got); date != tc.date {
+			t.Errorf("monicaGiftDateField(%q) = %q, want %q", got, date, tc.date)
+		}
 	}
 }
 
@@ -885,6 +1065,45 @@ func TestMonicaImportContacts_Duplicate(t *testing.T) {
 	if len(contacts) != expectedCount {
 		t.Errorf("expected %d contacts in vault (1 shadow + 3 imported), got %d", expectedCount, len(contacts))
 	}
+
+	var john models.Contact
+	if err := svc.DB.Where("vault_id = ? AND first_name = ?", vaultID, "John").First(&john).Error; err != nil {
+		t.Fatalf("John not found: %v", err)
+	}
+	for _, title := range []string{
+		"Monica description",
+		"Monica first met through",
+		"Monica last talked to",
+	} {
+		var count int64
+		if err := svc.DB.Model(&models.Note{}).
+			Where("contact_id = ? AND title = ?", john.ID, title).
+			Count(&count).Error; err != nil {
+			t.Fatalf("failed to count metadata note %q: %v", title, err)
+		}
+		if count != 1 {
+			t.Errorf("expected one %q note after re-import, got %d", title, count)
+		}
+	}
+	var firstMetCount int64
+	if err := svc.DB.Model(&models.ContactImportantDate{}).
+		Joins("JOIN contact_important_date_types cidt ON cidt.id = contact_important_dates.contact_important_date_type_id").
+		Where("contact_important_dates.contact_id = ? AND cidt.internal_type = ?", john.ID, "first_met").
+		Count(&firstMetCount).Error; err != nil {
+		t.Fatalf("failed to count first-met dates: %v", err)
+	}
+	if firstMetCount != 1 {
+		t.Errorf("expected one first-met date after re-import, got %d", firstMetCount)
+	}
+	var stayInTouchCount int64
+	if err := svc.DB.Model(&models.ContactReminder{}).
+		Where("contact_id = ? AND label = ?", john.ID, "Stay in touch").
+		Count(&stayInTouchCount).Error; err != nil {
+		t.Fatalf("failed to count stay-in-touch reminders: %v", err)
+	}
+	if stayInTouchCount != 1 {
+		t.Errorf("expected one stay-in-touch reminder after re-import, got %d", stayInTouchCount)
+	}
 }
 
 func TestMonicaImportRelationships_Basic(t *testing.T) {
@@ -922,6 +1141,52 @@ func TestMonicaImportRelationships_Basic(t *testing.T) {
 	}
 	if relType.Name == nil || strings.ToLower(*relType.Name) != "spouse" {
 		t.Errorf("expected relationship type name=spouse, got %v", relType.Name)
+	}
+}
+
+func TestMonicaImportRelationships_BestfriendAlias(t *testing.T) {
+	svc, vaultID, userID, _ := setupMonicaImportTest(t)
+
+	exportJSON := `{
+		"version": "1.0-preview.1",
+		"account": {
+			"uuid": "test-account",
+			"data": [
+				{"count": 2, "type": "contacts", "values": [
+					{"uuid": "c1", "properties": {"first_name": "Alice"}, "data": []},
+					{"uuid": "c2", "properties": {"first_name": "Bob"}, "data": []}
+				]},
+				{"count": 1, "type": "relationships", "values": [
+					{"uuid": "r1", "properties": {"type": "bestfriend", "contact_is": "c1", "of_contact": "c2"}}
+				]}
+			],
+			"properties": {},
+			"instance": {}
+		}
+	}`
+
+	resp, err := svc.Import(vaultID, userID, []byte(exportJSON))
+	if err != nil {
+		t.Fatalf("Import failed: %v", err)
+	}
+	if resp.ImportedRelationships != 1 {
+		t.Fatalf("expected 1 imported bestfriend relationship, got %d (errors=%v)", resp.ImportedRelationships, resp.Errors)
+	}
+
+	var alice models.Contact
+	if err := svc.DB.Where("vault_id = ? AND first_name = ?", vaultID, "Alice").First(&alice).Error; err != nil {
+		t.Fatalf("Alice not found: %v", err)
+	}
+	var rel models.Relationship
+	if err := svc.DB.Where("contact_id = ?", alice.ID).First(&rel).Error; err != nil {
+		t.Fatalf("bestfriend relationship not found: %v", err)
+	}
+	var relType models.RelationshipType
+	if err := svc.DB.First(&relType, rel.RelationshipTypeID).Error; err != nil {
+		t.Fatalf("relationship type not found: %v", err)
+	}
+	if relType.Name == nil || strings.ToLower(*relType.Name) != "best friend" {
+		t.Errorf("expected relationship type name=best friend, got %v", relType.Name)
 	}
 }
 
@@ -1031,6 +1296,9 @@ func TestMonicaImportActivities(t *testing.T) {
 			if !strings.Contains(n.Body, "Had a great time catching up over pasta") {
 				t.Error("expected activity note to contain description")
 			}
+			if n.CreatedAt.Format(time.RFC3339) != "2024-01-03T18:00:00Z" {
+				t.Errorf("expected activity note CreatedAt to preserve happened_at, got %s", n.CreatedAt.Format(time.RFC3339))
+			}
 			foundActivity = true
 			break
 		}
@@ -1065,6 +1333,9 @@ func TestMonicaImportConversations(t *testing.T) {
 		if n.Title != nil && strings.Contains(*n.Title, "Conversation") {
 			if !strings.Contains(n.Body, "Me: Hey, how are you?") {
 				t.Errorf("expected conversation note body to contain message, got: %s", n.Body)
+			}
+			if n.CreatedAt.Format(time.RFC3339) != "2024-01-05T14:00:00Z" {
+				t.Errorf("expected conversation note CreatedAt to preserve happened_at, got %s", n.CreatedAt.Format(time.RFC3339))
 			}
 			foundConversation = true
 			break
